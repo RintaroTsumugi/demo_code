@@ -15,7 +15,7 @@ if "profile" not in st.session_state:
     st.session_state.profile = {}
 
 # ── Header ────────────────────────────────────────────────────────────────────
-st.title("🍚 Gợi ý thực đơn hàng ngày")
+st.title("🍚 Hôm nay ăn gì")
 st.caption("Tính toán dinh dưỡng và gợi ý thực đơn phù hợp mục tiêu cá nhân")
 st.divider()
 
