@@ -1,0 +1,184 @@
+# recommender.py — Tầng 3: hard filter + scoring + pick top meals
+import pandas as pd
+import random
+
+DATA_PATH = "data/final_dishname.csv"
+
+# map protein source label (UI) → substring trong protein_sources_str (CSV)
+SOURCE_MAP = {
+    "Gà":     "ga",
+    "Bò":     "bo",
+    "Cá":     "ca",
+    "Tôm":    "hai_san",
+    "Heo":    "heo",
+    "Đậu hũ": "dam_thuc_vat",
+    "Trứng":  "trung",
+}
+
+# map snack_label (UI) → dish_type trong CSV
+SNACK_TYPE_MAP = {
+    "Đồ uống": "đồ uống",
+    "Ăn vặt":  "đồ ăn vặt",
+    "Đồ ngọt": "đồ ngọt",
+}
+
+# dish_type hợp lệ cho bữa chính (standalone hoặc rice_meal)
+MAIN_DISH_TYPES = {"món chính", "món canh", "món phụ", "món độc lập"}
+
+
+def load_db():
+    df = pd.read_csv(DATA_PATH)
+    # loại bỏ món có lỗi calo
+    df = df[~df["is_calories_error"]].reset_index(drop=True)
+    return df
+
+
+def _source_match(row_sources, preferred_sources):
+    """True nếu món có ít nhất 1 nguồn đạm user thích."""
+    if not preferred_sources:
+        return True
+    if pd.isna(row_sources):
+        return False
+    for ui_label in preferred_sources:
+        key = SOURCE_MAP.get(ui_label, "")
+        if key and key in str(row_sources):
+            return True
+    return False
+
+
+def hard_filter(df, diet_type, meal_id, snack_label, calo_quota, eaten_ids=None):
+    """
+    Lọc cứng theo:
+    - diet_type: Mặn / Chay
+    - meal_type trong CSV phải khớp bữa
+    - calo không vượt quota
+    - loại trừ món đã ăn gần đây
+    """
+    eaten_ids = eaten_ids or set()
+
+    # diet
+    diet_csv = "Món chay" if diet_type == "Chay" else "Món mặn"
+    df = df[df["diet_type"] == diet_csv]
+
+    # loại món lỗi calo quá quota
+    df = df[df["calories_per_person"] <= calo_quota]
+
+    # loại món đã ăn
+    if eaten_ids:
+        df = df[~df["food_id"].isin(eaten_ids)]
+
+    # meal_type theo bữa
+    if meal_id == "Phụ":
+        snack_dish_type = SNACK_TYPE_MAP.get(snack_label, "đồ ăn vặt")
+        df = df[df["dish_type"] == snack_dish_type]
+    else:
+        # bữa sáng: standalone
+        if meal_id == "Sáng":
+            df = df[df["meal_type"].str.contains("sáng", na=False)]
+        else:
+            # bữa chính: lọc theo dish_type hợp lệ
+            df = df[df["dish_type"].isin(MAIN_DISH_TYPES)]
+            df = df[df["meal_type"].str.contains("chính", na=False)]
+
+    return df.reset_index(drop=True)
+
+
+def score_dish(row, meal_target, preferred_sources):
+    """
+    Score cold-start:
+    - 0.45 nutrition: protein_ratio gần target
+    - 0.25 diversity: luôn 1.0 ở cold start
+    - 0.20 preference: nguồn đạm đúng
+    - 0.10 fiber bonus
+    - 0.05 sugar score
+    """
+    calo = row["calories_per_person"] or 1
+    protein_ratio = row["protein_per_person"] / calo
+    fat_ratio     = row["fat_per_person"] / calo
+
+    target_p = meal_target["protein"] / meal_target["calo"]
+    target_f = meal_target["fat"]     / meal_target["calo"]
+
+    nutrition_score = max(0, 1 - (
+        abs(protein_ratio - target_p) + abs(fat_ratio - target_f)
+    ) / 2)
+
+    preference_score = 1.0 if _source_match(row["protein_sources_str"], preferred_sources) else 0.5
+
+    fiber_score = min((row["fiber_per_person"] or 0) / calo * 100, 1)
+    sugar_score = 1 - min((row["sugar_per_person"] or 0) / calo * 100, 1)
+
+    return (
+        0.45 * nutrition_score
+      + 0.25 * 1.0           # diversity = 1.0 cold start
+      + 0.20 * preference_score
+      + 0.10 * fiber_score
+      + 0.05 * sugar_score
+    )
+
+
+def recommend_meal(meal_id, meal_target, diet_type, preferred_sources,
+                   snack_label="Không có", meal_mode="Cơm + món",
+                   eaten_ids=None, top_n=3):
+    """
+    Trả về list top_n dict món ăn gợi ý cho 1 bữa.
+    meal_id: "Sáng" | "Trưa" | "Tối" | "Phụ"
+    """
+    df = load_db()
+    pool = hard_filter(df, diet_type, meal_id, snack_label,
+                       meal_target["calo"], eaten_ids)
+
+    if pool.empty:
+        return []
+
+    pool = pool.copy()
+    pool["_score"] = pool.apply(
+        lambda r: score_dish(r, meal_target, preferred_sources), axis=1
+    )
+    pool = pool.sort_values("_score", ascending=False).head(top_n)
+
+    results = []
+    for _, row in pool.iterrows():
+        results.append({
+            "food_id":   int(row["food_id"]),
+            "dish_name": row["dish_name"],
+            "dish_type": row["dish_type"],
+            "calo":      round(row["calories_per_person"]),
+            "protein":   round(row["protein_per_person"], 1),
+            "fat":       round(row["fat_per_person"], 1),
+            "fiber":     round(row["fiber_per_person"], 1),
+            "image_url": row["image_link"],
+            "score":     round(row["_score"], 3),
+        })
+    return results
+
+
+def recommend_day(meal_targets, diet_type, preferred_sources,
+                  snack_label="Không có",
+                  lunch_mode="Cơm + món", dinner_mode="Cơm + món",
+                  eaten_ids=None):
+    """
+    Gợi ý toàn ngày. Trả về dict { meal_id: [danh sách món] }.
+    """
+    meal_modes = {
+        "Sáng": "Độc lập",
+        "Trưa": lunch_mode,
+        "Tối":  dinner_mode,
+        "Phụ":  snack_label,
+    }
+
+    day_results = {}
+    for meal_id, target in meal_targets.items():
+        suggestions = recommend_meal(
+            meal_id=meal_id,
+            meal_target=target,
+            diet_type=diet_type,
+            preferred_sources=preferred_sources,
+            snack_label=snack_label,
+            meal_mode=meal_modes.get(meal_id, "Độc lập"),
+            eaten_ids=eaten_ids,
+            top_n=3,
+        )
+        day_results[meal_id] = suggestions
+
+    return day_results
